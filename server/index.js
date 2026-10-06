@@ -6,6 +6,7 @@ const { Server } = require("socket.io");
 const app = express();
 const CLIENT_URL = process.env.CLIENT_URL || "*";
 app.use(cors({ origin: CLIENT_URL }));
+app.use(express.json({ limit: "10kb" }));
 app.get("/", (req, res) => res.send("Travel chat server is running"));
 
 const server = http.createServer(app);
@@ -23,11 +24,95 @@ const REPORTS_TO_BAN = 3;
 
 const ROLES = ["traveler", "local"];
 const TAGS = ["backpacking", "food", "budget", "solo", "study abroad", "business"];
+const HANDLE_RE = /^[A-Za-z0-9._@+\- ]{2,40}$/;
 
 const BAD_WORDS = ["fuck", "shit", "bitch", "asshole", "bastard", "pussy", "porn", "slut", "whore"];
 const BAD_RE = new RegExp("\\b(" + BAD_WORDS.join("|") + ")\\w*", "gi");
 const URL_RE = /(https?:\/\/|www\.|\b[a-z0-9-]+\.(com|net|org|io|me|co|in|ru|xyz|ly)\b)/i;
 
+// ---------- Translation (Google Cloud Translation, key stays on the server) ----------
+const translateCache = new Map();
+const translateIpHits = new Map();
+const translateIpDay = new Map();
+const translateDaily = { day: "", chars: 0 };
+const IP_PER_MIN = 30;
+const IP_PER_DAY = 300;
+const DAILY_CHAR_CAP = 200000;
+
+function reqIp(req) {
+  const fwd = req.headers["x-forwarded-for"];
+  if (fwd) return String(fwd).split(",")[0].trim();
+  return req.socket.remoteAddress || "unknown";
+}
+
+app.post("/api/translate", async (req, res) => {
+  const key = process.env.GOOGLE_TRANSLATE_API_KEY;
+  if (!key) return res.status(503).json({ error: "Translation is not set up yet." });
+
+  const text = String((req.body && req.body.text) || "").trim();
+  const target = String((req.body && req.body.targetLang) || "en");
+  if (!text || text.length > 500) {
+    return res.status(400).json({ error: "Message is empty or too long." });
+  }
+  if (!/^[a-z]{2,3}(-[A-Za-z]{2,4})?$/.test(target)) {
+    return res.status(400).json({ error: "Unsupported language." });
+  }
+
+  const cacheKey = target + "|" + text;
+  if (translateCache.has(cacheKey)) {
+    return res.json({ translated: translateCache.get(cacheKey) });
+  }
+
+  const ip = reqIp(req);
+  const now = Date.now();
+  const today = new Date().toISOString().slice(0, 10);
+  const hits = (translateIpHits.get(ip) || []).filter((t) => now - t < 60000);
+  if (hits.length >= IP_PER_MIN) {
+    return res.status(429).json({ error: "Too many translations. Wait a moment." });
+  }
+  const dayInfo = translateIpDay.get(ip);
+  const dayCount = dayInfo && dayInfo.day === today ? dayInfo.count : 0;
+  if (dayCount >= IP_PER_DAY) {
+    return res.status(429).json({ error: "Daily translation limit reached." });
+  }
+  if (translateDaily.day !== today) {
+    translateDaily.day = today;
+    translateDaily.chars = 0;
+  }
+  if (translateDaily.chars + text.length > DAILY_CHAR_CAP) {
+    return res.status(429).json({ error: "Translation is paused for today." });
+  }
+
+  hits.push(now);
+  translateIpHits.set(ip, hits);
+  translateIpDay.set(ip, { day: today, count: dayCount + 1 });
+  translateDaily.chars += text.length;
+
+  try {
+    const r = await fetch(
+      "https://translation.googleapis.com/language/translate/v2?key=" + encodeURIComponent(key),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ q: text, target, format: "text" }),
+      }
+    );
+    const data = await r.json();
+    if (!r.ok || !data.data) {
+      console.log("TRANSLATE ERROR " + r.status + " " + JSON.stringify((data && data.error && data.error.message) || ""));
+      return res.status(502).json({ error: "Translation failed." });
+    }
+    const translated = data.data.translations[0].translatedText;
+    if (translateCache.size > 500) translateCache.clear();
+    translateCache.set(cacheKey, translated);
+    res.json({ translated });
+  } catch (e) {
+    console.log("TRANSLATE ERROR " + e.message);
+    res.status(502).json({ error: "Translation failed." });
+  }
+});
+
+// ---------- Chat helpers ----------
 function getIp(socket) {
   const fwd = socket.handshake.headers["x-forwarded-for"];
   if (fwd) return String(fwd).split(",")[0].trim();
@@ -99,6 +184,8 @@ function removeFromQueue(id) {
 function pair(a, b) {
   partners.set(a.socket.id, b.socket);
   partners.set(b.socket.id, a.socket);
+  a.socket.data.contact = null;
+  b.socket.data.contact = null;
   const entries = [];
   chatLogs.set(a.socket.id, { entries, side: "A" });
   chatLogs.set(b.socket.id, { entries, side: "B" });
@@ -129,11 +216,13 @@ function findMatch(me) {
 function leave(socket) {
   removeFromQueue(socket.id);
   chatLogs.delete(socket.id);
+  socket.data.contact = null;
   const partner = partners.get(socket.id);
   if (partner) {
     partners.delete(socket.id);
     partners.delete(partner.id);
     chatLogs.delete(partner.id);
+    partner.data.contact = null;
     partner.emit("partner_left");
   }
 }
@@ -211,6 +300,25 @@ io.on("connection", (socket) => {
     if (!allow(socket, "typing", 20, 5000)) return;
     const partner = partners.get(socket.id);
     if (partner) partner.emit("typing", !!isTyping);
+  });
+
+  socket.on("share_contact", (handle) => {
+    const partner = partners.get(socket.id);
+    if (!partner) return;
+    if (!allow(socket, "contact", 5, 60000)) return;
+    if (socket.data.contact) return;
+    const h = String(handle || "").trim();
+    if (!HANDLE_RE.test(h)) {
+      socket.emit("notice", "That doesn't look right. Use a username or phone number.");
+      return;
+    }
+    socket.data.contact = h;
+    if (partner.data.contact) {
+      socket.emit("contact_revealed", { handle: partner.data.contact });
+      partner.emit("contact_revealed", { handle: socket.data.contact });
+    } else {
+      partner.emit("contact_offer");
+    }
   });
 
   socket.on("report", (reason) => {
