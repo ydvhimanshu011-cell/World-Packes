@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import { COUNTRY_CODES } from "./countries.js";
+import "./safety.css";
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || "http://localhost:3000";
 const regionNames = new Intl.DisplayNames(["en"], { type: "region" });
+const URL_RE = /(https?:\/\/|www\.|\b[a-z0-9-]+\.(com|net|org|io|me|co|in|ru|xyz|ly)\b)/i;
+const REPORT_REASONS = ["Spam", "Harassment or hate", "Sexual content", "Other"];
 
 function flag(code) {
   return code
@@ -33,7 +36,10 @@ function label(code) {
 export default function App() {
   const socketRef = useRef(null);
   const typingTimer = useRef(null);
+  const noticeTimer = useRef(null);
   const bottomRef = useRef(null);
+  const sentTimes = useRef([]);
+  const lastSent = useRef("");
 
   const [connected, setConnected] = useState(false);
   const [online, setOnline] = useState(0);
@@ -47,6 +53,15 @@ export default function App() {
   const [text, setText] = useState("");
   const [strangerTyping, setStrangerTyping] = useState(false);
   const [showRelax, setShowRelax] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [banned, setBanned] = useState(false);
+  const [reporting, setReporting] = useState(false);
+
+  function showNotice(msg) {
+    setNotice(msg);
+    clearTimeout(noticeTimer.current);
+    noticeTimer.current = setTimeout(() => setNotice(""), 4000);
+  }
 
   useEffect(() => {
     const socket = io(SERVER_URL);
@@ -54,6 +69,11 @@ export default function App() {
 
     socket.on("connect", () => setConnected(true));
     socket.on("disconnect", () => setConnected(false));
+    socket.on("connect_error", (err) => {
+      if (err && err.message === "banned") setBanned(true);
+    });
+    socket.on("banned", () => setBanned(true));
+    socket.on("notice", (m) => showNotice(m));
     socket.on("online", (n) => setOnline(n));
     socket.on("waiting", () => {
       setStatus("waiting");
@@ -63,6 +83,7 @@ export default function App() {
       setStatus("chatting");
       setStranger(d.country);
       setShowRelax(false);
+      setReporting(false);
       setMessages([
         { system: true, text: "You are now chatting with a stranger. Say hi!" },
       ]);
@@ -75,9 +96,21 @@ export default function App() {
     socket.on("partner_left", () => {
       setStatus("left");
       setStrangerTyping(false);
+      setReporting(false);
       setMessages((list) => [
         ...list,
         { system: true, text: "Stranger disconnected." },
+      ]);
+    });
+    socket.on("reported", () => {
+      setStatus("left");
+      setStrangerTyping(false);
+      setMessages((list) => [
+        ...list,
+        {
+          system: true,
+          text: "Report sent. You have been disconnected from this stranger.",
+        },
       ]);
     });
 
@@ -108,6 +141,7 @@ export default function App() {
   function next() {
     setMessages([]);
     setStrangerTyping(false);
+    setReporting(false);
     setStatus("waiting");
     setStranger("");
     socketRef.current.emit("join", { country, wantCountry: want });
@@ -116,6 +150,7 @@ export default function App() {
   function stop() {
     socketRef.current.emit("leave");
     setMessages([]);
+    setReporting(false);
     setStatus("waiting");
     setScreen("home");
   }
@@ -126,9 +161,30 @@ export default function App() {
     setShowRelax(false);
   }
 
+  function doReport(reason) {
+    socketRef.current.emit("report", reason);
+    setReporting(false);
+  }
+
   function send() {
     const t = text.trim();
     if (!t || status !== "chatting") return;
+    if (URL_RE.test(t)) {
+      showNotice("Links and email addresses aren't allowed in chat.");
+      return;
+    }
+    if (lastSent.current === t.toLowerCase()) {
+      showNotice("Please don't repeat the same message.");
+      return;
+    }
+    const now = Date.now();
+    sentTimes.current = sentTimes.current.filter((x) => now - x < 5000);
+    if (sentTimes.current.length >= 5) {
+      showNotice("You're sending messages too fast. Slow down.");
+      return;
+    }
+    sentTimes.current.push(now);
+    lastSent.current = t.toLowerCase();
     socketRef.current.emit("message", t);
     socketRef.current.emit("typing", false);
     setMessages((list) => [...list, { from: "me", text: t }]);
@@ -147,6 +203,20 @@ export default function App() {
 
   function onKey(e) {
     if (e.key === "Enter") send();
+  }
+
+  if (banned) {
+    return (
+      <div className="page">
+        <div className="card">
+          <h1>Temporarily banned</h1>
+          <p className="sub">
+            Several users reported you, so you can't use Travel Chat for 24
+            hours.
+          </p>
+        </div>
+      </div>
+    );
   }
 
   if (screen === "home") {
@@ -187,7 +257,7 @@ export default function App() {
 
           <p className="rules">
             Be kind. No hate, spam, or sharing personal details like your hotel
-            or address.
+            or address. Users who are reported can be banned.
           </p>
 
           <button disabled={!connected || !country || !adult} onClick={start}>
@@ -203,8 +273,18 @@ export default function App() {
     <div className="chat">
       <header>
         <span>{stranger ? label(stranger) : "Looking for a stranger…"}</span>
-        <small>{online} online</small>
+        <div className="header-right">
+          <small>{online} online</small>
+          {status === "chatting" && (
+            <button className="report-btn" onClick={() => setReporting(true)}>
+              Report
+            </button>
+          )}
+        </div>
       </header>
+      <div className="safety-banner">
+        Never share your hotel, address, or passport details.
+      </div>
 
       <div className="messages">
         {status === "waiting" && (
@@ -229,6 +309,24 @@ export default function App() {
         {strangerTyping && <div className="sys">Stranger is typing…</div>}
         <div ref={bottomRef} />
       </div>
+
+      {notice && <div className="toast">{notice}</div>}
+
+      {reporting && (
+        <div className="report-panel">
+          <div>Report this stranger for:</div>
+          <div className="report-options">
+            {REPORT_REASONS.map((r) => (
+              <button key={r} className="ghost" onClick={() => doReport(r)}>
+                {r}
+              </button>
+            ))}
+          </div>
+          <button className="link" onClick={() => setReporting(false)}>
+            Cancel
+          </button>
+        </div>
+      )}
 
       <div className="bar">
         <button className="ghost" onClick={stop}>
