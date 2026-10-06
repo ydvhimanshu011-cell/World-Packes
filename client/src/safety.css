@@ -1,0 +1,7 @@
+.safety-banner { background: #422006; color: #fde68a; font-size: 12px; padding: 6px 16px; text-align: center; }
+.header-right { display: flex; align-items: center; gap: 10px; }
+.report-btn { padding: 6px 12px; font-size: 13px; background: #7f1d1d; }
+.report-panel { background: #1e293b; border-top: 1px solid #334155; padding: 12px; display: flex; flex-direction: column; gap: 8px; font-size: 14px; }
+.report-options { display: flex; flex-wrap: wrap; gap: 8px; }
+.report-options button { flex: 1 1 45%; font-size: 14px; }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: 90px; background: #7f1d1d; color: #fff; padding: 10px 16px; border-radius: 10px; font-size: 14px; max-width: 90%; text-align: center; z-index: 10; }
