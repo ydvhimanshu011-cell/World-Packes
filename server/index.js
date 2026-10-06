@@ -21,6 +21,9 @@ const reportsAgainst = new Map();
 const BAN_MS = 24 * 60 * 60 * 1000;
 const REPORTS_TO_BAN = 3;
 
+const ROLES = ["traveler", "local"];
+const TAGS = ["backpacking", "food", "budget", "solo", "study abroad", "business"];
+
 const BAD_WORDS = ["fuck", "shit", "bitch", "asshole", "bastard", "pussy", "porn", "slut", "whore"];
 const BAD_RE = new RegExp("\\b(" + BAD_WORDS.join("|") + ")\\w*", "gi");
 const URL_RE = /(https?:\/\/|www\.|\b[a-z0-9-]+\.(com|net|org|io|me|co|in|ru|xyz|ly)\b)/i;
@@ -52,14 +55,40 @@ function allow(socket, key, max, windowMs) {
   return true;
 }
 
+function cleanList(list, max, allowed) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const item of list) {
+    const v = String(item).slice(0, 30);
+    if (allowed && !allowed.includes(v)) continue;
+    if (!out.includes(v)) out.push(v);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
 function broadcastCount() {
   io.emit("online", io.engine.clientsCount);
 }
 
 function compatible(a, b) {
-  const aOk = a.wantCountry === "Any" || a.wantCountry === b.country;
-  const bOk = b.wantCountry === "Any" || b.wantCountry === a.country;
-  return aOk && bOk;
+  const countryOk =
+    (a.wantCountry === "Any" || a.wantCountry === b.country) &&
+    (b.wantCountry === "Any" || b.wantCountry === a.country);
+  const roleOk =
+    (a.wantRole === "Any" || a.wantRole === b.role) &&
+    (b.wantRole === "Any" || b.wantRole === a.role);
+  return countryOk && roleOk;
+}
+
+function score(a, b) {
+  const langs = a.languages.filter((l) => b.languages.includes(l)).length;
+  const tags = a.tags.filter((t) => b.tags.includes(t)).length;
+  return langs * 10 + tags;
+}
+
+function publicProfile(p) {
+  return { country: p.country, role: p.role, languages: p.languages, tags: p.tags };
 }
 
 function removeFromQueue(id) {
@@ -73,18 +102,27 @@ function pair(a, b) {
   const entries = [];
   chatLogs.set(a.socket.id, { entries, side: "A" });
   chatLogs.set(b.socket.id, { entries, side: "B" });
-  a.socket.emit("matched", { country: b.country });
-  b.socket.emit("matched", { country: a.country });
+  a.socket.emit("matched", publicProfile(b));
+  b.socket.emit("matched", publicProfile(a));
 }
 
 function findMatch(me) {
-  const idx = waiting.findIndex((w) => compatible(me, w));
-  if (idx === -1) {
+  let best = -1;
+  let bestScore = -1;
+  waiting.forEach((w, i) => {
+    if (!compatible(me, w)) return;
+    const s = score(me, w);
+    if (s > bestScore) {
+      best = i;
+      bestScore = s;
+    }
+  });
+  if (best === -1) {
     waiting.push(me);
     me.socket.emit("waiting");
     return;
   }
-  const other = waiting.splice(idx, 1)[0];
+  const other = waiting.splice(best, 1)[0];
   pair(me, other);
 }
 
@@ -119,10 +157,15 @@ io.on("connection", (socket) => {
       return;
     }
     leave(socket);
+    const d = data || {};
     const me = {
       socket,
-      country: String((data && data.country) || "Unknown").slice(0, 60),
-      wantCountry: String((data && data.wantCountry) || "Any").slice(0, 60),
+      country: String(d.country || "Unknown").slice(0, 60),
+      wantCountry: String(d.wantCountry || "Any").slice(0, 60),
+      role: ROLES.includes(d.role) ? d.role : "traveler",
+      wantRole: ROLES.includes(d.wantRole) ? d.wantRole : "Any",
+      languages: cleanList(d.languages, 5).filter((l) => /^[a-z]{2,3}$/.test(l)),
+      tags: cleanList(d.tags, 4, TAGS),
     };
     profiles.set(socket.id, me);
     findMatch(me);
@@ -133,6 +176,7 @@ io.on("connection", (socket) => {
     if (!me || partners.has(socket.id)) return;
     removeFromQueue(socket.id);
     me.wantCountry = "Any";
+    me.wantRole = "Any";
     findMatch(me);
   });
 
