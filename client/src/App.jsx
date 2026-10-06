@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import { COUNTRY_CODES } from "./countries.js";
+import { LANGUAGE_CODES, TAGS } from "./languages.js";
 import "./safety.css";
+import "./profile.css";
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || "http://localhost:3000";
 const regionNames = new Intl.DisplayNames(["en"], { type: "region" });
+const languageNames = new Intl.DisplayNames(["en"], { type: "language" });
 const URL_RE = /(https?:\/\/|www\.|\b[a-z0-9-]+\.(com|net|org|io|me|co|in|ru|xyz|ly)\b)/i;
 const REPORT_REASONS = ["Spam", "Harassment or hate", "Sexual content", "Other"];
 
@@ -24,6 +27,14 @@ function nameOf(code) {
   }
 }
 
+function languageName(code) {
+  try {
+    return languageNames.of(code) || code;
+  } catch (e) {
+    return code;
+  }
+}
+
 const COUNTRIES = COUNTRY_CODES.map((code) => ({ code, name: nameOf(code) })).sort(
   (a, b) => a.name.localeCompare(b.name)
 );
@@ -31,6 +42,17 @@ const COUNTRIES = COUNTRY_CODES.map((code) => ({ code, name: nameOf(code) })).so
 function label(code) {
   if (code === "Any") return "Any country";
   return flag(code) + " " + nameOf(code);
+}
+
+function profileLine(info) {
+  const parts = [info.role === "local" ? "Lives there" : "Traveling"];
+  if (info.languages && info.languages.length) {
+    parts.push(info.languages.map(languageName).join(", "));
+  }
+  if (info.tags && info.tags.length) {
+    parts.push(info.tags.map((t) => "#" + t.replace(/ /g, "")).join(" "));
+  }
+  return parts.join(" · ");
 }
 
 export default function App() {
@@ -46,9 +68,13 @@ export default function App() {
   const [adult, setAdult] = useState(false);
   const [country, setCountry] = useState("");
   const [want, setWant] = useState("Any");
+  const [role, setRole] = useState("traveler");
+  const [wantRole, setWantRole] = useState("Any");
+  const [languages, setLanguages] = useState([]);
+  const [tags, setTags] = useState([]);
   const [screen, setScreen] = useState("home");
   const [status, setStatus] = useState("waiting");
-  const [stranger, setStranger] = useState("");
+  const [info, setInfo] = useState(null);
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
   const [strangerTyping, setStrangerTyping] = useState(false);
@@ -61,6 +87,15 @@ export default function App() {
     setNotice(msg);
     clearTimeout(noticeTimer.current);
     noticeTimer.current = setTimeout(() => setNotice(""), 4000);
+  }
+
+  function toggle(list, setList, item, max) {
+    if (list.includes(item)) setList(list.filter((x) => x !== item));
+    else if (list.length < max) setList([...list, item]);
+  }
+
+  function joinPayload() {
+    return { country, wantCountry: want, role, wantRole, languages, tags };
   }
 
   useEffect(() => {
@@ -77,11 +112,11 @@ export default function App() {
     socket.on("online", (n) => setOnline(n));
     socket.on("waiting", () => {
       setStatus("waiting");
-      setStranger("");
+      setInfo(null);
     });
     socket.on("matched", (d) => {
       setStatus("chatting");
-      setStranger(d.country);
+      setInfo(d);
       setShowRelax(false);
       setReporting(false);
       setMessages([
@@ -118,13 +153,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (screen !== "chat" || status !== "waiting" || want === "Any") {
+    const anyone = want === "Any" && wantRole === "Any";
+    if (screen !== "chat" || status !== "waiting" || anyone) {
       setShowRelax(false);
       return;
     }
     const t = setTimeout(() => setShowRelax(true), 30000);
     return () => clearTimeout(t);
-  }, [screen, status, want]);
+  }, [screen, status, want, wantRole]);
 
   useEffect(() => {
     if (bottomRef.current) bottomRef.current.scrollIntoView({ behavior: "smooth" });
@@ -133,9 +169,10 @@ export default function App() {
   function start() {
     setMessages([]);
     setStrangerTyping(false);
+    setInfo(null);
     setStatus("waiting");
     setScreen("chat");
-    socketRef.current.emit("join", { country, wantCountry: want });
+    socketRef.current.emit("join", joinPayload());
   }
 
   function next() {
@@ -143,14 +180,15 @@ export default function App() {
     setStrangerTyping(false);
     setReporting(false);
     setStatus("waiting");
-    setStranger("");
-    socketRef.current.emit("join", { country, wantCountry: want });
+    setInfo(null);
+    socketRef.current.emit("join", joinPayload());
   }
 
   function stop() {
     socketRef.current.emit("leave");
     setMessages([]);
     setReporting(false);
+    setInfo(null);
     setStatus("waiting");
     setScreen("home");
   }
@@ -158,6 +196,7 @@ export default function App() {
   function relax() {
     socketRef.current.emit("relax");
     setWant("Any");
+    setWantRole("Any");
     setShowRelax(false);
   }
 
@@ -236,6 +275,48 @@ export default function App() {
             ))}
           </select>
 
+          <label>I am</label>
+          <div className="role-row">
+            <button
+              className={"chip" + (role === "traveler" ? " on" : "")}
+              onClick={() => setRole("traveler")}
+            >
+              ✈️ Traveling
+            </button>
+            <button
+              className={"chip" + (role === "local" ? " on" : "")}
+              onClick={() => setRole("local")}
+            >
+              🏠 I live here
+            </button>
+          </div>
+
+          <label>Languages you speak ({languages.length}/5)</label>
+          <div className="chips lang-box">
+            {LANGUAGE_CODES.map((code) => (
+              <button
+                key={code}
+                className={"chip" + (languages.includes(code) ? " on" : "")}
+                onClick={() => toggle(languages, setLanguages, code, 5)}
+              >
+                {languageName(code)}
+              </button>
+            ))}
+          </div>
+
+          <label>Trip tags, optional ({tags.length}/4)</label>
+          <div className="chips">
+            {TAGS.map((tag) => (
+              <button
+                key={tag}
+                className={"chip" + (tags.includes(tag) ? " on" : "")}
+                onClick={() => toggle(tags, setTags, tag, 4)}
+              >
+                {tag}
+              </button>
+            ))}
+          </div>
+
           <label>Who do you want to meet?</label>
           <select value={want} onChange={(e) => setWant(e.target.value)}>
             <option value="Any">Any country</option>
@@ -245,6 +326,14 @@ export default function App() {
               </option>
             ))}
           </select>
+          <select value={wantRole} onChange={(e) => setWantRole(e.target.value)}>
+            <option value="Any">Travelers and locals</option>
+            <option value="traveler">Only travelers</option>
+            <option value="local">Only locals</option>
+          </select>
+          <p className="hint">
+            We try to match people who share a language first, then trip tags.
+          </p>
 
           <label className="check">
             <input
@@ -272,7 +361,10 @@ export default function App() {
   return (
     <div className="chat">
       <header>
-        <span>{stranger ? label(stranger) : "Looking for a stranger…"}</span>
+        <div className="header-left">
+          <span>{info ? label(info.country) : "Looking for a stranger…"}</span>
+          {info && <div className="profile-line">{profileLine(info)}</div>}
+        </div>
         <div className="header-right">
           <small>{online} online</small>
           {status === "chatting" && (
